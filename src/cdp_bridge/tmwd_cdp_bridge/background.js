@@ -1,4 +1,47 @@
-// background.js - Cookie + CDP Bridge
+// background.js - CDP Bridge
+try { importScripts('config.js'); } catch (_) {}
+
+const DEFAULT_BRIDGE_CONFIG = {
+  bridgeHost: typeof DEFAULT_BRIDGE_HOST !== 'undefined' ? DEFAULT_BRIDGE_HOST : '127.0.0.1',
+  bridgePort: typeof DEFAULT_BRIDGE_PORT !== 'undefined' ? DEFAULT_BRIDGE_PORT : 18765,
+  bridgeToken: '__default__',
+};
+let bridgeConfig = { ...DEFAULT_BRIDGE_CONFIG };
+let bridgeWsUrl = buildWsUrl(bridgeConfig);
+let connecting = false;
+
+async function loadBridgeConfig() {
+  bridgeConfig = await chrome.storage.local.get(DEFAULT_BRIDGE_CONFIG);
+  bridgeConfig.bridgeHost = normalizeBridgeHost(bridgeConfig.bridgeHost || DEFAULT_BRIDGE_CONFIG.bridgeHost);
+  bridgeConfig.bridgePort = normalizeBridgePort(bridgeConfig.bridgeHost, bridgeConfig.bridgePort);
+  if (!bridgeConfig.bridgeToken) {
+    bridgeConfig.bridgeToken = DEFAULT_BRIDGE_CONFIG.bridgeToken;
+    await chrome.storage.local.set({ bridgeToken: bridgeConfig.bridgeToken });
+  }
+  bridgeWsUrl = buildWsUrl(bridgeConfig);
+  return bridgeConfig;
+}
+
+function normalizeBridgeHost(host) {
+  return String(host || DEFAULT_BRIDGE_CONFIG.bridgeHost).replace(/^wss?:\/\//, '').replace(/\/+$/, '');
+}
+
+function normalizeBridgePort(host, port) {
+  const parsedPort = Number(port);
+  if (Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535) return parsedPort;
+  return isLocalBridge(host) ? DEFAULT_BRIDGE_CONFIG.bridgePort : '';
+}
+
+function buildWsUrl(config) {
+  const host = normalizeBridgeHost(config.bridgeHost);
+  const port = normalizeBridgePort(host, config.bridgePort);
+  return port ? `ws://${host}:${port}` : `ws://${host}`;
+}
+
+function isLocalBridge(host) {
+  return /^(127\.0\.0\.1|localhost)$/.test(host);
+}
+
 chrome.runtime.onInstalled.addListener(() => {
   console.log('CDP Bridge installed');
   // Strip CSP headers to allow eval/inline scripts
@@ -16,7 +59,21 @@ chrome.runtime.onInstalled.addListener(() => {
 });
 
 async function handleExtMessage(msg, sender) {
-  if (msg.cmd === 'cookies') return await handleCookies(msg, sender);
+  // 插件页面交互事件
+  if (msg.cmd === 'bridge_config_get') return { ok: true, data: await loadBridgeConfig() };
+  if (msg.cmd === 'bridge_config_set') {
+    const nextConfig = { ...(msg.config || {}) };
+    if (!nextConfig.bridgeToken) nextConfig.bridgeToken = DEFAULT_BRIDGE_CONFIG.bridgeToken;
+    await chrome.storage.local.set(nextConfig);
+    await loadBridgeConfig();
+    if (ws) ws.close();
+    ws = null;
+    connectWS();
+    return { ok: true, data: bridgeConfig };
+  }
+
+  // 业务事件
+
   if (msg.cmd === 'cdp') return await handleCDP(msg, sender);
   if (msg.cmd === 'batch') return await handleBatch(msg, sender);
   if (msg.cmd === 'tabs') {
@@ -73,26 +130,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true;
 });
 
-async function handleCookies(msg, sender) {
-  try {
-    let url = msg.url || sender.tab?.url;
-    if (!url && msg.tabId) {
-      const tab = await chrome.tabs.get(msg.tabId);
-      url = tab.url;
-    }
-    const origin = url.match(/^https?:\/\/[^\/]+/)[0];
-    const all = await chrome.cookies.getAll({ url });
-    const part = await chrome.cookies.getAll({ url, partitionKey: { topLevelSite: origin } }).catch(() => []);
-    const merged = [...all];
-    for (const c of part) {
-      if (!merged.some(x => x.name === c.name && x.domain === c.domain)) merged.push(c);
-    }
-    return { ok: true, data: merged };
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
-}
-
 async function handleBatch(msg, sender) {
   const R = [];
   let attached = null;
@@ -101,9 +138,7 @@ async function handleBatch(msg, sender) {
   try {
     for (const c of msg.commands) {
       if (c.tabId === undefined && msg.tabId !== undefined) c.tabId = msg.tabId;
-      if (c.cmd === 'cookies') {
-        R.push(await handleCookies(c, sender));
-      } else if (c.cmd === 'tabs') {
+      if (c.cmd === 'tabs') {
         const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url));
         R.push({ ok: true, data: tabs.map(t => ({ id: t.id, url: t.url, title: t.title, active: t.active, windowId: t.windowId })) });
       } else if (c.cmd === 'cdp') {
@@ -201,7 +236,6 @@ function buildCdpScript(code) {
 
 // --- WebSocket Client for TMWebDriver ---
 let ws = null;
-const WS_URL = 'ws://127.0.0.1:18765';
 
 function scheduleProbe() {
   // Use chrome.alarms to survive MV3 service worker suspension
@@ -215,9 +249,11 @@ function scheduleKeepalive() {
 
 async function isServerAlive() {
   try {
+    const config = await loadBridgeConfig();
+    if (!isLocalBridge(config.bridgeHost)) return true;
     const ctrl = new AbortController();
     setTimeout(() => ctrl.abort(), 2000);
-    await fetch('http://127.0.0.1:18765', { signal: ctrl.signal });
+    await fetch(`http://${config.bridgeHost}:${config.bridgePort}`, { signal: ctrl.signal });
     return true; // Got HTTP response → port is listening
   } catch (e) {
     return false; // Network error (connection refused) or timeout → server not alive
@@ -232,7 +268,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === 'tmwd-ws-keepalive') {
     // Keepalive: ping to keep SW alive + detect dead connections
     if (ws && ws.readyState === WebSocket.OPEN) {
-      try { ws.send('{"type":"ping"}'); } catch (_) {}
+      try { ws.send(JSON.stringify({ type: 'ping' })); } catch (_) {}
       scheduleKeepalive();
     } else {
       // Connection lost, switch to probe mode
@@ -323,26 +359,32 @@ async function handleWsExec(data) {
   }
 }
 
-function connectWS() {
-  if (ws && ws.readyState <= 1) return; // CONNECTING or OPEN
+async function connectWS() {
+  if (connecting || (ws && ws.readyState <= 1)) return; // CONNECTING or OPEN
+  connecting = true;
   ws = null;
-  console.log('[TMWD-WS] Connecting to', WS_URL);
+  await loadBridgeConfig();
+  console.log('[TMWD-WS] Connecting to', bridgeWsUrl);
   try {
-    ws = new WebSocket(WS_URL);
+    ws = new WebSocket(bridgeWsUrl);
   } catch (e) {
     console.error('[TMWD-WS] Constructor error:', e);
     ws = null;
+    connecting = false;
     scheduleProbe();
     return;
   }
   ws.onopen = async () => {
+    connecting = false;
     console.log('[TMWD-WS] Connected!');
     scheduleKeepalive(); // Keep SW alive while connected
     const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url));
-    ws.send(JSON.stringify({
+    const msg = {
       type: 'ext_ready',
       tabs: tabs.map(t => ({ id: t.id, url: t.url, title: t.title }))
-    }));
+    };
+    if (bridgeConfig.bridgeToken) msg.token = bridgeConfig.bridgeToken;
+    ws.send(JSON.stringify(msg));
     console.log('[TMWD-WS] Sent ext_ready with', tabs.length, 'tabs');
   };
   ws.onmessage = async (event) => {
@@ -375,6 +417,7 @@ function connectWS() {
   };
   ws.onclose = () => {
     console.log('[TMWD-WS] Disconnected');
+    connecting = false;
     ws = null;
     scheduleProbe();
   };
@@ -393,10 +436,12 @@ chrome.runtime.onInstalled.addListener(() => connectWS());
 async function sendTabsUpdate() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   const tabs = (await chrome.tabs.query({})).filter(t => isScriptable(t.url) && !/streamlit/i.test(t.title));
-  ws.send(JSON.stringify({
+  const msg = {
     type: 'tabs_update',
     tabs: tabs.map(t => ({ id: t.id, url: t.url, title: t.title }))
-  }));
+  };
+  if (bridgeConfig.bridgeToken) msg.token = bridgeConfig.bridgeToken;
+  ws.send(JSON.stringify(msg));
 }
 chrome.tabs.onUpdated.addListener((_, changeInfo) => {
   if (changeInfo.status === 'complete') sendTabsUpdate();

@@ -1,6 +1,7 @@
 import asyncio, json, time
 import importlib
 from typing import Any
+from contextvars import ContextVar
 
 from mcp.server.fastmcp import FastMCP
 
@@ -8,15 +9,29 @@ from . import simphtml
 
 mcp = FastMCP("tmwebdriver-bridge")
 
-from .TMWebDriver import TMWebDriver
-driver = TMWebDriver()
+current_token: ContextVar[str] = ContextVar("current_token", default="")
 
-def get_driver():
+from .TMWebDriver import TMWebDriver
+driver: TMWebDriver | None = None
+
+
+def configure_driver(websocket_port: int = 18765, multi_user: bool = False, allowed_tokens: list[str] | None = None) -> TMWebDriver:
+    global driver
+    if driver is None:
+        driver = TMWebDriver(port=websocket_port, multi_user=multi_user, allowed_tokens=allowed_tokens)
     return driver
 
+def get_driver():
+    return configure_driver()
 
-def _ensure_sessions(d: TMWebDriver) -> list[dict[str, Any]]:
-    sessions = d.get_all_sessions()
+def _get_token() -> str | None:
+    """Get the current request token from ContextVar."""
+    token = current_token.get("")
+    return token if token else None
+
+
+def _ensure_sessions(d: TMWebDriver, token: str | None = None) -> list[dict[str, Any]]:
+    sessions = d.get_all_sessions(token=token)
     if len(sessions) == 0:
         raise RuntimeError("No browser tabs connected.")
     return sessions
@@ -28,24 +43,26 @@ def _normalize_tab_id(tab_id: str | int | None) -> int | None:
     return int(tab_id)
 
 
-def _extension_command(d: TMWebDriver, cmd: dict[str, Any], tab_id: str | int | None = None, timeout: float = 15) -> Any:
+def _extension_command(d: TMWebDriver, cmd: dict[str, Any], tab_id: str | int | None = None, timeout: float = 15, token: str | None = None) -> Any:
     normalized_tab_id = _normalize_tab_id(tab_id)
     if normalized_tab_id is not None and "tabId" not in cmd:
         cmd["tabId"] = normalized_tab_id
-    result = d.execute_js(json.dumps(cmd, ensure_ascii=False), timeout=timeout)
+    result = d.execute_js(json.dumps(cmd, ensure_ascii=False), timeout=timeout, token=token)
     return result.get("data", result)
 
 
 @mcp.tool()
 async def browser_get_tabs() -> str:
     """Get all open browser tabs with their IDs, URLs, and titles."""
+    token = _get_token()
     def _run():
         d = get_driver()
-        sessions = d.get_all_sessions()
+        ctx = d.get_context(token)
+        sessions = d.get_all_sessions(token=token)
         for s in sessions:
             s.pop('connected_at', None)
             s.pop('type', None)
-        return json.dumps({"tabs": sessions, "active_tab": d.default_session_id}, ensure_ascii=False)
+        return json.dumps({"tabs": sessions, "active_tab": ctx.default_session_id}, ensure_ascii=False)
     return await asyncio.to_thread(_run)
 
 
@@ -58,16 +75,18 @@ async def browser_scan(tabs_only: bool = False, switch_tab_id: str = "", text_on
         switch_tab_id: Switch to this tab before scanning.
         text_only: Return plain text instead of simplified HTML.
     """
+    token = _get_token()
     def _run():
         d = get_driver()
-        if len(d.get_all_sessions()) == 0:
+        ctx = d.get_context(token)
+        if len(d.get_all_sessions(token=token)) == 0:
             return json.dumps({"status": "error", "msg": "No browser tabs connected. Ensure Chrome extension is running."}, ensure_ascii=False)
 
         if switch_tab_id:
-            d.default_session_id = switch_tab_id
+            ctx.default_session_id = switch_tab_id
 
         tabs = []
-        for sess in d.get_all_sessions():
+        for sess in d.get_all_sessions(token=token):
             sess.pop('connected_at', None)
             sess.pop('type', None)
             sess['url'] = sess.get('url', '')[:80]
@@ -75,11 +94,11 @@ async def browser_scan(tabs_only: bool = False, switch_tab_id: str = "", text_on
 
         result = {
             "status": "success",
-            "metadata": {"tabs_count": len(tabs), "tabs": tabs, "active_tab": d.default_session_id}
+            "metadata": {"tabs_count": len(tabs), "tabs": tabs, "active_tab": ctx.default_session_id}
         }
         if not tabs_only:
             importlib.reload(simphtml)
-            result["content"] = simphtml.get_html(d, cutlist=True, maxchars=35000, text_only=text_only)
+            result["content"] = simphtml.get_html(d, cutlist=True, maxchars=35000, text_only=text_only, token=token)
         return json.dumps(result, ensure_ascii=False, default=str)
     return await asyncio.to_thread(_run)
 
@@ -93,14 +112,16 @@ async def browser_execute_js(script: str, switch_tab_id: str = "", no_monitor: b
         switch_tab_id: Switch to this tab before executing.
         no_monitor: Skip DOM change monitoring (faster, less info).
     """
+    token = _get_token()
     def _run():
         d = get_driver()
-        if len(d.get_all_sessions()) == 0:
+        ctx = d.get_context(token)
+        if len(d.get_all_sessions(token=token)) == 0:
             return json.dumps({"status": "error", "msg": "No browser tabs connected."}, ensure_ascii=False)
         if switch_tab_id:
-            d.default_session_id = switch_tab_id
+            ctx.default_session_id = switch_tab_id
         importlib.reload(simphtml)
-        result = simphtml.execute_js_rich(script, d, no_monitor=no_monitor)
+        result = simphtml.execute_js_rich(script, d, no_monitor=no_monitor, token=token)
         return json.dumps(result, ensure_ascii=False, default=str)
     return await asyncio.to_thread(_run)
 
@@ -112,17 +133,57 @@ async def browser_switch_tab(tab_id: str) -> str:
     Args:
         tab_id: The tab ID to switch to (from browser_get_tabs).
     """
+    token = _get_token()
     def _run():
         d = get_driver()
-        _ensure_sessions(d)
-        d.default_session_id = tab_id
-        session = d.sessions.get(tab_id)
+        ctx = d.get_context(token)
+        _ensure_sessions(d, token=token)
+        ctx.default_session_id = tab_id
+        session = ctx.sessions.get(tab_id)
         if not session or not session.is_active():
             return json.dumps({"status": "error", "msg": f"Tab {tab_id} not found or disconnected."}, ensure_ascii=False)
         return json.dumps({
             "status": "success",
             "active_tab": tab_id,
             "url": session.info.get('url', ''),
+        }, ensure_ascii=False, default=str)
+    return await asyncio.to_thread(_run)
+
+
+@mcp.tool()
+async def browser_focus_tab(tab_id: str) -> str:
+    """Bring a Chrome tab to the foreground: activate the tab AND focus its window.
+
+    Unlike browser_switch_tab (which only changes the MCP-side active session
+    without touching the visible Chrome UI), this actually makes the tab visible
+    to the user. Use this when the user can't find the tab the agent is working
+    on (e.g. across many windows / Spaces / minimized windows).
+
+    Goes through chrome.tabs.update + chrome.windows.update (extension-native
+    APIs), avoiding the chrome.debugger CDP "Not allowed" restriction on
+    Target.activateTarget.
+
+    Args:
+        tab_id: The tab ID to focus (from browser_get_tabs).
+    """
+    def _run():
+        d = get_driver()
+        _ensure_sessions(d)
+        normalized = _normalize_tab_id(tab_id)
+        if normalized is None:
+            return json.dumps({"status": "error", "msg": "tab_id is required"}, ensure_ascii=False)
+        result = _extension_command(
+            d,
+            {"cmd": "tabs", "method": "switch", "tabId": normalized},
+            timeout=10,
+        )
+        # User asked us to bring this tab to the front — they will most likely
+        # operate on it next, so sync the MCP-side active session too.
+        d.default_session_id = tab_id
+        return json.dumps({
+            "status": "success",
+            "focused_tab": tab_id,
+            "extension_response": result,
         }, ensure_ascii=False, default=str)
     return await asyncio.to_thread(_run)
 
@@ -137,10 +198,11 @@ async def browser_batch(commands: list[dict[str, Any]], tab_id: str = "", timeou
         tab_id: Optional tab ID inherited by commands that omit tabId.
         timeout: Seconds to wait for the batch result.
     """
+    token = _get_token()
     def _run():
         d = get_driver()
-        _ensure_sessions(d)
-        result = _extension_command(d, {"cmd": "batch", "commands": commands}, tab_id=tab_id, timeout=timeout)
+        _ensure_sessions(d, token=token)
+        result = _extension_command(d, {"cmd": "batch", "commands": commands}, tab_id=tab_id, timeout=timeout, token=token)
         return json.dumps({"status": "success", "results": result}, ensure_ascii=False, default=str)
     return await asyncio.to_thread(_run)
 
@@ -155,11 +217,13 @@ async def browser_wait(condition_js: str, timeout: float = 10, interval: float =
         interval: Seconds between checks.
         switch_tab_id: Optional tab ID to make active before waiting.
     """
+    token = _get_token()
     def _run():
         d = get_driver()
-        _ensure_sessions(d)
+        ctx = d.get_context(token)
+        _ensure_sessions(d, token=token)
         if switch_tab_id:
-            d.default_session_id = switch_tab_id
+            ctx.default_session_id = switch_tab_id
         deadline = time.time() + max(timeout, 0)
         last_value = None
         last_error = None
@@ -167,7 +231,7 @@ async def browser_wait(condition_js: str, timeout: float = 10, interval: float =
         while True:
             attempts += 1
             try:
-                response = d.execute_js(condition_js, timeout=min(max(interval, 0.2), 5))
+                response = d.execute_js(condition_js, timeout=min(max(interval, 0.2), 5), token=token)
                 last_value = response.get("data", response.get("result"))
                 last_error = None
                 if last_value:
@@ -175,7 +239,7 @@ async def browser_wait(condition_js: str, timeout: float = 10, interval: float =
                         "status": "success",
                         "value": last_value,
                         "attempts": attempts,
-                        "tab_id": d.default_session_id,
+                        "tab_id": ctx.default_session_id,
                     }, ensure_ascii=False, default=str)
             except Exception as e:
                 last_error = str(e)
@@ -185,7 +249,7 @@ async def browser_wait(condition_js: str, timeout: float = 10, interval: float =
                     "value": last_value,
                     "error": last_error,
                     "attempts": attempts,
-                    "tab_id": d.default_session_id,
+                    "tab_id": ctx.default_session_id,
                 }, ensure_ascii=False, default=str)
             time.sleep(max(interval, 0.1))
     return await asyncio.to_thread(_run)
@@ -198,11 +262,12 @@ async def browser_navigate(url: str) -> str:
     Args:
         url: The URL to navigate to.
     """
+    token = _get_token()
     def _run():
         d = get_driver()
-        if len(d.get_all_sessions()) == 0:
+        if len(d.get_all_sessions(token=token)) == 0:
             return json.dumps({"status": "error", "msg": "No browser tabs connected."}, ensure_ascii=False)
-        d.jump(url, timeout=10)
+        d.jump(url, timeout=10, token=token)
         return json.dumps({"status": "success", "msg": f"Navigating to {url}"}, ensure_ascii=False)
     return await asyncio.to_thread(_run)
 
@@ -214,37 +279,19 @@ async def browser_screenshot(tab_id: str = "") -> str:
     Args:
         tab_id: Optional tab ID to screenshot. Uses active tab if empty.
     """
+    token = _get_token()
     def _run():
         d = get_driver()
-        if len(d.get_all_sessions()) == 0:
+        if len(d.get_all_sessions(token=token)) == 0:
             return json.dumps({"status": "error", "msg": "No browser tabs connected."}, ensure_ascii=False)
         cmd = {"cmd": "cdp", "method": "Page.captureScreenshot", "params": {"format": "png"}}
         if tab_id:
             cmd["tabId"] = int(tab_id)
-        result = d.execute_js(json.dumps(cmd))
+        result = d.execute_js(json.dumps(cmd), token=token)
         data = result.get('data', {})
         if isinstance(data, dict) and 'data' in data:
             return json.dumps({"status": "success", "format": "png", "base64": data['data']}, ensure_ascii=False)
         return json.dumps({"status": "success", "data": data}, ensure_ascii=False, default=str)
-    return await asyncio.to_thread(_run)
-
-
-@mcp.tool()
-async def browser_cookies(url: str = "") -> str:
-    """Get cookies for the current page or a specific URL.
-
-    Args:
-        url: URL to get cookies for. If empty, gets cookies for the active tab's URL.
-    """
-    def _run():
-        d = get_driver()
-        if len(d.get_all_sessions()) == 0:
-            return json.dumps({"status": "error", "msg": "No browser tabs connected."}, ensure_ascii=False)
-        cmd = {"cmd": "cookies"}
-        if url:
-            cmd["url"] = url
-        result = d.execute_js(json.dumps(cmd))
-        return json.dumps({"status": "success", "cookies": result.get('data', [])}, ensure_ascii=False, default=str)
     return await asyncio.to_thread(_run)
 
 
