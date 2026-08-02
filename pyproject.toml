@@ -31,7 +31,7 @@ classifiers = [
 dependencies = [
     "beautifulsoup4>=4.14.3",
     "bottle>=0.13.4",
-    "mcp>=1.27.0",
+    "mcp>=1.27.0,<2.0.0",
     "requests>=2.33.1",
     "simple-websocket-server>=0.4.4",
 ]

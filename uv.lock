@@ -58,7 +58,7 @@ wheels = [
 
 [[package]]
 name = "cdp-bridge"
-version = "0.1.21"
+version = "0.1.22"
 source = { editable = "." }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -72,7 +72,7 @@ dependencies = [
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.14.3" },
     { name = "bottle", specifier = ">=0.13.4" },
-    { name = "mcp", specifier = ">=1.27.0" },
+    { name = "mcp", specifier = ">=1.27.0,<2.0.0" },
     { name = "requests", specifier = ">=2.33.1" },
     { name = "simple-websocket-server", specifier = ">=0.4.4" },
 ]
