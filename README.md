@@ -253,6 +253,42 @@ CDP_BRIDGE_TOKENS="team_alice,team_bob" uvx cdp-bridge@latest --transport stream
 
 不传 `--transport` 时默认使用 `stdio`。`stdio` 模式没有 MCP HTTP 端口；`streamable-http` 模式的 MCP 服务地址为 `http://127.0.0.1:<port>/mcp`。
 
+### MCP 对比测评（V3）
+
+V3 修正了 V2 “只要模型返回非空文本就算成功”的统计问题，改用场景级验收规则，并把场景分为确定性核心对比、真实登录态诊断和标签页诊断。核心对比会记录通过率、质量、工具成功率、API 轮次、Token 和耗时，同时生成 Markdown 报告与结构化 JSON。默认测试当前工作区源码，并固定 Playwright MCP 版本，避免 `latest` 漂移。
+
+```bash
+export ANTHROPIC_API_KEY="你的 API Key"
+export ANTHROPIC_BASE_URL="https://api.deepseek.com/anthropic"  # 可选
+export ANTHROPIC_MODEL="deepseek-v4-pro"                       # 可选
+
+# 只做前置检查和本地构建，不调用 LLM
+uv run python reports/V-003-2026-08-09/eval_mcp_compare_v3.py --preflight --build-check
+
+# 核心对比，默认每个场景重复 3 次
+uv run python reports/V-003-2026-08-09/eval_mcp_compare_v3.py --repeats 3
+
+# 加入真实登录态和标签页诊断场景
+uv run python reports/V-003-2026-08-09/eval_mcp_compare_v3.py --suite all --repeats 3
+```
+
+查看 [V3 测试报告](reports/V-003-2026-08-09/eval_compare_report.md) 和 [V3 测评脚本](reports/V-003-2026-08-09/eval_mcp_compare_v3.py)。脚本运行时还会在同一目录生成 `eval_results.json`；默认不保存完整工具正文，避免把真实标签页或页面隐私写入结果，确需审计时可增加 `--save-tool-output`。
+
+2026-08-09 的 V3 样例使用 `cdp-bridge 0.1.23`、Playwright MCP `0.0.79` 和 `deepseek-v4-pro`，在 `core` 模式下对 3 个场景各重复 3 次，共执行 18 次任务。两侧任务通过率和平均质量均为 **100% / 1.00**。
+
+下表依次列出“中位耗时 / 平均工具调用 / 工具成功率 / 中位总 Token”：
+
+| 场景 | CDP Bridge | Playwright |
+|---|---:|---:|
+| 本地确定性内容提取 | 12.56s / 2.0 / 100.0% / 940 | 11.03s / 2.0 / 100.0% / 773 |
+| 本地确定性交互 | 16.37s / 3.0 / 100.0% / 1,084 | 22.54s / 5.0 / 80.0% / 1,451 |
+| NumPy 外部页面 | 37.24s / 4.7 / 100.0% / 7,212 | 60.52s / 8.0 / 83.3% / 21,535 |
+
+本次运行中，Playwright 在简单内容提取场景耗时和 Token 更低；CDP Bridge 在交互与外部页面场景使用了更少的工具调用和 Token，并取得更低的中位耗时与更高的工具成功率。以上是特定模型、网络和浏览器会话下的端到端结果，不代表通用性能结论；真实登录态与标签页场景属于诊断项，未计入本次核心质量排名。
+
+<details>
+<summary>V2 测评说明与历史样例</summary>
+
 ### MCP 对比测评（V2）
 
 仓库提供了 V2 测评脚本，用相同的用户 query、LLM 和 MCP 工具调用循环，对比 CDP Bridge 与 Playwright MCP 的实际任务表现。测评记录以下指标：
@@ -289,6 +325,8 @@ python reports/V-002-2026-07-12/eval_mcp_compare_v2.py --preflight
 | 当前标签页列表 | 8.8s / 1 次调用 | 4.4s / 1 次调用 | Playwright 更快；两侧浏览器会话中的标签页数量并不等价 |
 
 测评中的“答案质量”是基于场景验收词的可解释启发式分数，不替代人工核验。CDP Bridge 连接用户的真实浏览器会话，而 Playwright 通常使用独立浏览器环境；两者的 Cookie、缓存、页面推荐流、网络和安全策略可能不同，因此该测评是端到端工作流参考，不是纯协议或浏览器引擎基准。
+
+</details>
 
 ### Token 与多用户隔离
 

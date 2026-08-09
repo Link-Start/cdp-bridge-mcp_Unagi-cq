@@ -249,6 +249,38 @@ CDP_BRIDGE_TOKENS="team_alice,team_bob" uvx cdp-bridge@latest --transport stream
 
 When `--transport` is omitted, `stdio` is used by default. `stdio` mode has no MCP HTTP port. In `streamable-http` mode, the MCP service URL is `http://127.0.0.1:<port>/mcp`.
 
+### MCP Benchmark (V3)
+
+V3 replaces V2's “non-empty answer means success” rule with case-specific acceptance criteria. It separates deterministic core cases from live-session and tab diagnostics, pins the Playwright MCP version, alternates backend order, and writes both a Markdown report and structured JSON results.
+
+```bash
+# Preflight and package build only; does not call the LLM API
+uv run python reports/V-003-2026-08-09/eval_mcp_compare_v3.py --preflight --build-check
+
+# Core comparison, three repeats per case
+ANTHROPIC_API_KEY=... uv run python reports/V-003-2026-08-09/eval_mcp_compare_v3.py --repeats 3
+
+# Include live-session and tab diagnostics
+ANTHROPIC_API_KEY=... uv run python reports/V-003-2026-08-09/eval_mcp_compare_v3.py --suite all --repeats 3
+```
+
+See [the V3 report](../reports/V-003-2026-08-09/eval_compare_report.md) and [the V3 harness](../reports/V-003-2026-08-09/eval_mcp_compare_v3.py). Each run also generates `eval_results.json` in the same directory. Full tool output is omitted by default to avoid writing private page or tab content into the results; use `--save-tool-output` only when that content is required for an audit.
+
+The V3 sample run on August 9, 2026 used `cdp-bridge 0.1.23`, Playwright MCP `0.0.79`, and `deepseek-v4-pro`. It repeated three core scenarios three times per backend, for 18 task runs in total. Both backends achieved a **100% task pass rate and a 1.00 average quality score**.
+
+Each cell below shows median wall-clock time / average tool calls / tool success rate / median total tokens:
+
+| Scenario | CDP Bridge | Playwright |
+|---|---:|---:|
+| Deterministic local extraction | 12.56s / 2.0 / 100.0% / 940 | 11.03s / 2.0 / 100.0% / 773 |
+| Deterministic local interaction | 16.37s / 3.0 / 100.0% / 1,084 | 22.54s / 5.0 / 80.0% / 1,451 |
+| External NumPy page | 37.24s / 4.7 / 100.0% / 7,212 | 60.52s / 8.0 / 83.3% / 21,535 |
+
+In this run, Playwright used less time and fewer tokens for simple content extraction. CDP Bridge used fewer tool calls and tokens in the interaction and external-page scenarios, with lower median latency and a higher tool success rate. These are end-to-end observations for a specific model, network, and browser session, not universal performance claims. Live-login and tab scenarios are diagnostics and were excluded from the core quality ranking.
+
+<details>
+<summary>V2 evaluation notes and historical sample</summary>
+
 ### MCP Benchmark (V2)
 
 This repository includes a V2 evaluation script that compares CDP Bridge and Playwright MCP using the same user queries, LLM, and tool-calling loop. It records:
@@ -285,6 +317,8 @@ The report is written to [`reports/V-002-2026-07-12/eval_compare_report.md`](../
 | Current browser tabs | 8.8s / 1 call | 4.4s / 1 call | Playwright was faster; the two browser sessions did not expose the same tab set |
 
 The benchmark's answer-quality score is an interpretable heuristic based on scenario-specific acceptance terms, not a substitute for human review. CDP Bridge connects to the user's real browser session, while Playwright normally uses an isolated browser environment; cookies, cache, page recommendations, network conditions, and security policies can differ. Treat this as an end-to-end workflow reference, not as a pure protocol or browser-engine benchmark.
+
+</details>
 
 ### Token & Multi-User Isolation
 
