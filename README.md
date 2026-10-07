@@ -123,11 +123,13 @@ graph TB
 
 ## 可用工具
 
-MCP 服务当前暴露以下 10 个工具：
+MCP 服务当前暴露以下 12 个工具：
 
 | 工具名 | 参数 | 说明 |
 | --- | --- | --- |
 | `browser_get_tabs` | 无 | 获取所有已连接的浏览器标签页，返回标签页 ID、URL 和标题列表，以及当前活动标签页 |
+| `browser_observe` | `tab_id` (str), `limit` (int) | 列出可见交互控件，返回角色、名称、状态、位置、短期引用及 `page_revision`。默认观察 MCP 当前标签页；最多返回 150 个控件 |
+| `browser_act` | `tab_id` (str), `page_revision` (str), `ref` (str), `action` (str), `value` (str) | 对 `browser_observe` 返回的控件执行 `click` 或 `fill`，返回操作结果与页面文本变化。引用只能使用一次，有效期 60 秒；失效后重新观察 |
 | `browser_scan` | `tabs_only` (bool), `switch_tab_id` (str), `text_only` (bool) | 扫描活动标签页内容。`tabs_only` 仅返回标签页列表节省 token；`text_only` 返回纯文本而非简化 HTML；`switch_tab_id` 在扫描前先切换到指定标签页 |
 | `browser_execute_js` | `script` (str, 必填), `switch_tab_id` (str), `no_monitor` (bool) | 在浏览器中执行 JavaScript 并捕获返回值及 DOM 变更 diff。`no_monitor` 跳过 DOM 监控可提速；`switch_tab_id` 先切换到目标标签页再执行 |
 | `browser_switch_tab` | `tab_id` (str, 必填) | 切换 MCP 侧的活动标签页（不改变用户在 Chrome 中看到的标签页），后续工具调用将作用于该标签页 |
@@ -137,6 +139,8 @@ MCP 服务当前暴露以下 10 个工具：
 | `browser_navigate` | `url` (str, 必填) | 导航活动标签页到指定 URL |
 | `browser_screenshot` | `tab_id` (str) | 对活动标签页截图，返回 base64 编码的 PNG 图片数据 |
 | `browser_save_image` | `screenshot_json_str_or_file` (str, 必填), `output_path` (str) | 将 `browser_screenshot` 返回的 base64 截图数据保存为本地 PNG 文件。`screenshot_json_str_or_file` 为截图 JSON 字符串或 JSON 文件路径；`output_path` 为输出路径或目录 |
+
+语义操作流程：先调用 `browser_observe`，从结果中选择控件的 `ref`，再把同一结果中的 `tab_id` 和 `page_revision` 传给 `browser_act`。操作后重新观察。当前版本支持页面主文档与开放的 Shadow DOM；iframe 内的控件尚未包含在结果中。
 
 # 快速使用
 

@@ -79,6 +79,68 @@ def _extension_command(d: TMWebDriver, cmd: dict[str, Any], tab_id: str | int | 
 
 
 @mcp.tool()
+async def browser_observe(tab_id: str = "", limit: int = 80) -> str:
+    """List visible interactive controls on a tab with short-lived references.
+
+    Args:
+        tab_id: Tab to observe. Uses the active MCP tab if empty.
+        limit: Maximum controls to return, up to 150.
+
+    Returns a page_revision and control refs for browser_act. Observe again after
+    an action, navigation, or a stale-reference response.
+    """
+    token = _get_token()
+    def _run():
+        d = get_driver()
+        sessions = _ensure_sessions(d, token=token)
+        try:
+            if tab_id:
+                session_id, _ = _require_tab(d, tab_id, token=token)
+            else:
+                active_id = d.get_context(token).default_session_id
+                session_id = str(active_id) if any(str(s.get("id")) == str(active_id) for s in sessions) else str(sessions[0]["id"])
+            result = _extension_command(
+                d, {"cmd": "semantic", "method": "observe", "limit": limit},
+                tab_id=session_id, timeout=10, token=token,
+            )
+            return json.dumps(result, ensure_ascii=False, default=str)
+        except ValueError as e:
+            return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
+    return await asyncio.to_thread(_run)
+
+
+@mcp.tool()
+async def browser_act(tab_id: str, page_revision: str, ref: str, action: str, value: str = "") -> str:
+    """Click or fill one control returned by browser_observe.
+
+    Args:
+        tab_id: Tab ID returned by browser_observe.
+        page_revision: Revision returned by browser_observe.
+        ref: Control reference returned by browser_observe.
+        action: Either "click" or "fill".
+        value: Text to enter for "fill".
+
+    References are single-use and expire after 60 seconds. A stale result means
+    the page or target changed; call browser_observe again.
+    """
+    token = _get_token()
+    def _run():
+        d = get_driver()
+        try:
+            session_id, _ = _require_tab(d, tab_id, token=token)
+            result = _extension_command(
+                d,
+                {"cmd": "semantic", "method": "act", "page_revision": page_revision,
+                 "ref": ref, "action": action, "value": value},
+                tab_id=session_id, timeout=10, token=token,
+            )
+            return json.dumps(result, ensure_ascii=False, default=str)
+        except ValueError as e:
+            return json.dumps({"status": "error", "error": str(e)}, ensure_ascii=False)
+    return await asyncio.to_thread(_run)
+
+
+@mcp.tool()
 async def browser_get_tabs() -> str:
     """Get all open browser tabs with their IDs, URLs, and titles."""
     token = _get_token()
